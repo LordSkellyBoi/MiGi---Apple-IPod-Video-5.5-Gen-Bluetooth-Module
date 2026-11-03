@@ -1,0 +1,580 @@
+diff -urN a/apps/SOURCES b/apps/SOURCES
+--- a/apps/SOURCES	2026-11-03 02:15:00.162677147 -0800
++++ b/apps/SOURCES	2026-11-03 02:15:00.232106067 -0800
+@@ -71,6 +71,7 @@
+ iap/iap-lingo2.c
+ iap/iap-lingo3.c
+ iap/iap-lingo4.c
++iap/iap-btlink.c
+ #if CONFIG_TUNER
+ iap/iap-lingo7.c
+ #endif
+diff -urN a/apps/iap/iap-btlink.c b/apps/iap/iap-btlink.c
+--- a/apps/iap/iap-btlink.c	1969-12-31 16:00:00.000000000 -0800
++++ b/apps/iap/iap-btlink.c	2026-11-03 02:15:00.235484369 -0800
+@@ -0,0 +1,142 @@
++/***************************************************************************
++ * Private "BT link" lingo for talking to an external Bluetooth accessory.
++ * See iap-btlink.h.
++ *
++ * All files in this archive are subject to the GNU General Public License.
++ * See the file COPYING in the source tree root for full license agreement.
++ ****************************************************************************/
++#include <stdint.h>
++#include <string.h>
++#include "system.h"
++#include "audio.h"
++#include "iap-core.h"
++#include "iap-btlink.h"
++
++#define BTLINK_RX_DEPTH  16     /* frames from the accessory, waiting for the plugin */
++#define BTLINK_TX_DEPTH  4      /* frames from the plugin, waiting to be sent */
++
++struct btlink_frame {
++    uint8_t len;
++    uint8_t data[IAP_BTLINK_MAX];
++};
++
++static struct btlink_frame rx_q[BTLINK_RX_DEPTH];
++static volatile uint8_t rx_head, rx_tail;     /* iap thread writes head, plugin reads tail */
++
++static struct btlink_frame tx_q[BTLINK_TX_DEPTH];
++static volatile uint8_t tx_head, tx_tail;     /* plugin writes head, iap thread reads tail */
++
++#define BTLINK_PLAYBACK  0xA0   /* accessory -> iPod: play (1), pause (2), next track (3), previous track (4) */
++
++/* Carried out right here in the iap thread, so it works with the Hold switch on and without the plugin
++ * (iPod button events are ignored while Hold is on). */
++static void btlink_playback(unsigned char cmd)
++{
++    int status = audio_status();
++
++    switch (cmd) {
++    case 1:
++        if (status & AUDIO_STATUS_PAUSE)
++            audio_resume();
++        break;
++    case 2:
++        if ((status & AUDIO_STATUS_PLAY) && !(status & AUDIO_STATUS_PAUSE))
++            audio_pause();
++        break;
++    case 3:
++        audio_next();
++        break;
++    case 4:
++        audio_prev();
++        break;
++    }
++}
++
++/* iap thread: a packet for our lingo arrived. buf[0] is the lingo byte. */
++void iap_handlepkt_btlink(const unsigned int len, const unsigned char *buf)
++{
++    unsigned int n;
++    uint8_t next;
++    int level;
++
++    if (len < 2)                    /* lingo byte plus at least one payload byte */
++        return;
++    if (buf[1] == BTLINK_PLAYBACK) {    /* playback command: do it now, the plugin never sees it */
++        if (len >= 3)
++            btlink_playback(buf[2]);
++        return;
++    }
++    n = len - 1;
++    if (n > IAP_BTLINK_MAX)         /* too long, drop */
++        return;
++
++    level = disable_irq_save();
++    next = (uint8_t)((rx_head + 1) % BTLINK_RX_DEPTH);
++    if (next != rx_tail) {          /* if the queue is full the frame is dropped */
++        memcpy(rx_q[rx_head].data, buf + 1, n);
++        rx_q[rx_head].len = (uint8_t)n;
++        rx_head = next;
++    }
++    restore_irq(level);
++}
++
++int iap_btlink_recv(unsigned char *buf, int maxlen)
++{
++    int n = 0;
++    int level;
++
++    if (maxlen <= 0)
++        return 0;
++
++    level = disable_irq_save();
++    if (rx_tail != rx_head) {
++        n = rx_q[rx_tail].len;
++        if (n > maxlen)
++            n = maxlen;
++        memcpy(buf, rx_q[rx_tail].data, n);
++        rx_tail = (uint8_t)((rx_tail + 1) % BTLINK_RX_DEPTH);
++    }
++    restore_irq(level);
++    return n;
++}
++
++int iap_btlink_send(const unsigned char *data, int len)
++{
++    uint8_t next;
++    int level;
++    int ret = -1;
++
++    if (len < 1 || len > IAP_BTLINK_MAX)
++        return -1;
++
++    level = disable_irq_save();
++    next = (uint8_t)((tx_head + 1) % BTLINK_TX_DEPTH);
++    if (next != tx_tail) {
++        memcpy(tx_q[tx_head].data, data, len);
++        tx_q[tx_head].len = (uint8_t)len;
++        tx_head = next;
++        ret = 0;
++    }
++    restore_irq(level);
++    return ret;
++}
++
++/* iap thread, every 100 ms: transmit queued frames. Sending only from the
++ * iap thread keeps the shared TX buffer (iap_txnext) race-free. */
++void iap_btlink_periodic(void)
++{
++    if (iap_txpayload == NULL)      /* buffers not allocated yet */
++        return;
++
++    while (tx_tail != tx_head) {
++        const struct btlink_frame *f = &tx_q[tx_tail];
++
++        if ((int)f->len + 1 <= TX_BUFLEN) {
++            iap_txnext = iap_txpayload;
++            IAP_TX_PUT(IAP_LINGO_BTLINK);
++            IAP_TX_PUT_DATA(f->data, f->len);
++            iap_send_tx();
++        }
++        tx_tail = (uint8_t)((tx_tail + 1) % BTLINK_TX_DEPTH);
++    }
++}
+diff -urN a/apps/iap/iap-btlink.h b/apps/iap/iap-btlink.h
+--- a/apps/iap/iap-btlink.h	1969-12-31 16:00:00.000000000 -0800
++++ b/apps/iap/iap-btlink.h	2026-11-03 02:15:00.232139293 -0800
+@@ -0,0 +1,35 @@
++/***************************************************************************
++ * Private "BT link" lingo: lets a plugin talk to an external accessory
++ * (an STM32 + Bluetooth module) over the iPod's iAP serial port.
++ *
++ * Frames travel in ordinary iAP packets:  FF 55 <len> 1E <payload...> <chk>
++ * The first payload byte is a command/event code defined by the plugin and
++ * the accessory firmware; this layer just carries the bytes.
++ *
++ * All files in this archive are subject to the GNU General Public License.
++ * See the file COPYING in the source tree root for full license agreement.
++ ****************************************************************************/
++#ifndef _IAP_BTLINK_H
++#define _IAP_BTLINK_H
++
++/* Private lingo ID (not used by any Apple-defined lingo Rockbox implements) */
++#define IAP_LINGO_BTLINK  0x1E
++
++/* Maximum payload bytes per frame (excluding the lingo byte) */
++#define IAP_BTLINK_MAX    48
++
++/* iap thread: handle a received packet. buf[0] is the lingo byte. */
++void iap_handlepkt_btlink(const unsigned int len, const unsigned char *buf);
++
++/* iap thread: called every 100 ms, sends any frames queued by plugins */
++void iap_btlink_periodic(void);
++
++/* Any thread: queue a frame for the accessory. Returns 0 on success,
++ * -1 if the frame is too long or the queue is full. */
++int iap_btlink_send(const unsigned char *data, int len);
++
++/* Any thread: fetch the next frame from the accessory into buf (at most
++ * maxlen bytes). Returns the number of bytes, or 0 if none is waiting. */
++int iap_btlink_recv(unsigned char *buf, int maxlen);
++
++#endif /* _IAP_BTLINK_H */
+diff -urN a/apps/iap/iap-core.c b/apps/iap/iap-core.c
+--- a/apps/iap/iap-core.c	2026-11-03 02:15:00.160422293 -0800
++++ b/apps/iap/iap-core.c	2026-11-03 02:15:00.232148512 -0800
+@@ -24,6 +24,7 @@
+ #include "panic.h"
+ #include "iap-core.h"
+ #include "iap-lingo.h"
++#include "iap-btlink.h"
+ #include "button.h"
+ #include "config.h"
+ #include "cpu.h"
+@@ -751,6 +752,9 @@
+ 
+     if(!iap_setupflag) return;
+ 
++    /* send any frames queued by plugins for the BT link accessory */
++    iap_btlink_periodic();
++
+     /* Handle pending authentication tasks */
+     switch (device.auth.state)
+     {
+@@ -1315,6 +1319,7 @@
+         case 3: iap_handlepkt_mode3(length, iap_rxstart+2); break;
+         case 4: iap_handlepkt_mode4(length, iap_rxstart+2); break;
+         case 5: iap_handlepkt_mode5(length, iap_rxstart+2); break;
++        case IAP_LINGO_BTLINK: iap_handlepkt_btlink(length, iap_rxstart+2); break;
+ #if CONFIG_TUNER
+         case 7: iap_handlepkt_mode7(length, iap_rxstart+2); break;
+ #endif
+diff -urN a/apps/plugin.c b/apps/plugin.c
+--- a/apps/plugin.c	2026-11-03 02:15:00.164570650 -0800
++++ b/apps/plugin.c	2026-11-03 02:15:00.232148512 -0800
+@@ -34,6 +34,9 @@
+ #include "sound_menu.h"
+ #include "mp3data.h"
+ #include "powermgmt.h"
++#ifdef IPOD_ACCESSORY_PROTOCOL
++#include "iap/iap-btlink.h"
++#endif
+ #include "splash.h"
+ #include "logf.h"
+ #include "option_select.h"
+@@ -875,6 +878,10 @@
+     gui_synclist_scroll_stop,
+     add_event_ex,
+     remove_event_ex,
++#ifdef IPOD_ACCESSORY_PROTOCOL
++    iap_btlink_send,
++    iap_btlink_recv,
++#endif
+ };
+ 
+ static int plugin_buffer_handle;
+diff -urN a/apps/plugin.h b/apps/plugin.h
+--- a/apps/plugin.h	2026-11-03 02:15:00.164608013 -0800
++++ b/apps/plugin.h	2026-11-03 02:15:00.232180055 -0800
+@@ -179,7 +179,7 @@
+  * when this happens please take the opportunity to sort in
+  * any new functions "waiting" at the end of the list.
+  */
+-#define PLUGIN_API_VERSION 282
++#define PLUGIN_API_VERSION 283
+ 
+ /* 239 Marks the removal of ARCHOS HWCODEC and CHARCELL */
+ 
+@@ -1036,6 +1036,11 @@
+                                             void *event_data,
+                                             void *user_data),
+                             void *user_data);
++#ifdef IPOD_ACCESSORY_PROTOCOL
++    /* iPod accessory-port link to the Bluetooth module (apps/iap/iap-btlink.c) */
++    int (*iap_btlink_send)(const unsigned char *data, int len);
++    int (*iap_btlink_recv)(unsigned char *buf, int maxlen);
++#endif
+ };
+ 
+ /* plugin header */
+diff -urN a/apps/plugins/CATEGORIES b/apps/plugins/CATEGORIES
+--- a/apps/plugins/CATEGORIES	2026-11-03 02:15:00.168667977 -0800
++++ b/apps/plugins/CATEGORIES	2026-11-03 02:15:00.232180055 -0800
+@@ -9,6 +9,7 @@
+ blackjack,games
+ bmp,viewers
+ boomshine,games
++btpicker,apps
+ bounce,demos
+ brickmania,games
+ bubbles,games
+diff -urN a/apps/plugins/SOURCES b/apps/plugins/SOURCES
+--- a/apps/plugins/SOURCES	2026-11-03 02:15:00.166450051 -0800
++++ b/apps/plugins/SOURCES	2026-11-03 02:15:00.232211783 -0800
+@@ -50,6 +50,10 @@
+ otp.c
+ windows_lnk.c
+ 
++#ifdef IPOD_ACCESSORY_PROTOCOL
++btpicker.c
++#endif
++
+ #ifdef USB_ENABLE_HID
+ remote_control.c
+ #endif
+diff -urN a/apps/plugins/btpicker.c b/apps/plugins/btpicker.c
+--- a/apps/plugins/btpicker.c	1969-12-31 16:00:00.000000000 -0800
++++ b/apps/plugins/btpicker.c	2026-11-03 02:15:00.243415805 -0800
+@@ -0,0 +1,278 @@
++/***************************************************************************
++ * Bluetooth picker for the iPod + STM32 Bluetooth transmitter module.
++ *
++ * This plugin is only a menu client. The STM32 firmware decides what the
++ * menu shows and what every selection does, so new features need no Rockbox
++ * rebuild. It talks through the private iAP "BT link" lingo (see
++ * apps/iap/iap-btlink.c).
++ *
++ * All files in this archive are subject to the GNU General Public License.
++ * See the file COPYING in the source tree root for full license agreement.
++ ****************************************************************************/
++#include "plugin.h"
++
++/* ---- frame protocol shared with the STM32 firmware ----------------------
++ * Plugin -> module (first byte = code):
++ *   0x10 OPEN        the plugin has started
++ *   0x11 SELECT      followed by the id of the selected item
++ *   0x12 BACK        Menu/back was pressed
++ *   0x13 CLOSE       the plugin is exiting
++ *   0x14 TICK        sent every 2 s while the plugin is open
++ * Module -> plugin (first byte = code):
++ *   0x90 BEGIN       start of a new screen (resets the pending screen)
++ *   0x91 HEADER      line number (0 or 1), text (not NUL terminated)
++ *   0x92 ITEM        id, flags, text (not NUL terminated)
++ *   0x93 END         show the pending screen
++ *   0x94 EXIT        close the plugin
++ *   0x95 TOAST       text to show for two seconds
++ *   0xA0 PLAYBACK    1 play, 2 pause, 3 next track, 4 previous track
++ */
++#define REQ_OPEN    0x10
++#define REQ_SELECT  0x11
++#define REQ_BACK    0x12
++#define REQ_CLOSE   0x13
++#define REQ_TICK    0x14
++#define EV_BEGIN    0x90
++#define EV_HEADER   0x91
++#define EV_ITEM     0x92
++#define EV_END      0x93
++#define EV_EXIT     0x94
++#define EV_TOAST    0x95
++#define EV_PLAYBACK 0xA0
++
++#define FRAME_MAX   48          /* must match IAP_BTLINK_MAX */
++#define MAX_ITEMS   24
++#define TEXT_LEN    46
++#define HEADER_ROWS 2
++
++struct item {
++    unsigned char id;
++    char text[TEXT_LEN];
++};
++
++static struct item cur[MAX_ITEMS], pend[MAX_ITEMS];
++static int  n_cur, n_pend;
++static char hdr[2][TEXT_LEN], pend_hdr[2][TEXT_LEN];
++static bool have_menu;          /* a screen from the module has been shown */
++static bool want_exit;
++static int  sel, top;
++static unsigned char sel_id;    /* id of the highlighted item, kept across redraws */
++static long back_deadline;      /* 0 = none; leave locally if the module never answers a BACK */
++
++static void send_request(unsigned char code, int arg)
++{
++    unsigned char f[2];
++    int n = 0;
++
++    f[n++] = code;
++    if (arg >= 0)
++        f[n++] = (unsigned char)arg;
++    rb->iap_btlink_send(f, n);
++}
++
++static void copy_text(char *dst, const unsigned char *src, int n)
++{
++    int i;
++
++    if (n > TEXT_LEN - 1)
++        n = TEXT_LEN - 1;
++    for (i = 0; i < n; i++)
++        dst[i] = (src[i] >= 32 && src[i] < 127) ? (char)src[i] : '?';
++    dst[n] = '\0';
++}
++
++/* the pending screen is complete: show it, keeping the highlight on the same item if it still exists */
++static void commit_screen(void)
++{
++    int i, found = -1;
++
++    for (i = 0; i < n_pend; i++) {
++        if (sel_id != 0 && pend[i].id == sel_id) {
++            found = i;
++            break;
++        }
++    }
++    rb->memcpy(cur, pend, sizeof(struct item) * n_pend);
++    n_cur = n_pend;
++    rb->memcpy(hdr, pend_hdr, sizeof hdr);
++    if (found >= 0) {
++        sel = found;
++    } else {
++        sel = 0;
++        top = 0;
++    }
++    if (n_cur > 0)
++        sel_id = cur[sel].id;
++    have_menu = true;
++    back_deadline = 0;
++}
++
++static void do_playback(unsigned char cmd)
++{
++    int status = rb->audio_status();
++
++    switch (cmd) {
++    case 1:                     /* play */
++        if (status & AUDIO_STATUS_PAUSE)
++            rb->audio_resume();
++        break;
++    case 2:                     /* pause */
++        if ((status & AUDIO_STATUS_PLAY) && !(status & AUDIO_STATUS_PAUSE))
++            rb->audio_pause();
++        break;
++    case 3:
++        rb->audio_next();
++        break;
++    case 4:
++        rb->audio_prev();
++        break;
++    }
++}
++
++static void handle_frame(const unsigned char *f, int n)
++{
++    switch (f[0]) {
++    case EV_BEGIN:
++        n_pend = 0;
++        pend_hdr[0][0] = pend_hdr[1][0] = '\0';
++        break;
++    case EV_HEADER:
++        if (n >= 2 && f[1] < 2)
++            copy_text(pend_hdr[f[1]], &f[2], n - 2);
++        break;
++    case EV_ITEM:               /* f[1]=id, f[2]=flags, f[3..]=text */
++        if (n >= 3 && n_pend < MAX_ITEMS) {
++            pend[n_pend].id = f[1];
++            copy_text(pend[n_pend].text, &f[3], n - 3);
++            n_pend++;
++        }
++        break;
++    case EV_END:
++        commit_screen();
++        break;
++    case EV_EXIT:
++        want_exit = true;
++        break;
++    case EV_TOAST:
++        if (n >= 2) {
++            char msg[TEXT_LEN];
++            copy_text(msg, &f[1], n - 1);
++            rb->splashf(HZ * 2, "%s", msg);
++        }
++        break;
++    case EV_PLAYBACK:
++        if (n >= 2)
++            do_playback(f[1]);
++        break;
++    }
++}
++
++static void draw(int visible)
++{
++    int i;
++
++    rb->lcd_clear_display();
++    if (!have_menu) {
++        rb->lcd_putsf(0, 0, "Bluetooth: waiting for module...");
++    } else {
++        rb->lcd_putsf(0, 0, "%s", hdr[0]);
++        rb->lcd_putsf(0, 1, "%s", hdr[1]);
++        for (i = 0; i < visible && top + i < n_cur; i++)
++            rb->lcd_putsf(0, HEADER_ROWS + i, "%c %s",
++                          (top + i == sel) ? '>' : ' ', cur[top + i].text);
++    }
++    rb->lcd_update();
++}
++
++enum plugin_status plugin_start(const void *parameter)
++{
++    unsigned char f[FRAME_MAX];
++    int visible, w, h, n;
++    long next_tick;
++
++    (void)parameter;
++
++    rb->lcd_getstringsize("A", &w, &h);
++    if (h < 1)
++        h = 8;
++    visible = LCD_HEIGHT / h - HEADER_ROWS;
++    if (visible < 2)
++        visible = 2;
++
++    n_cur = n_pend = 0;
++    have_menu = want_exit = false;
++    sel = top = 0;
++    sel_id = 0;
++    back_deadline = 0;
++
++    send_request(REQ_OPEN, -1);
++    next_tick = *rb->current_tick + 2 * HZ;
++
++    while (1) {
++        int action;
++
++        while ((n = rb->iap_btlink_recv(f, sizeof f)) > 0)
++            handle_frame(f, n);
++
++        if (want_exit)
++            break;
++        if (back_deadline && (long)(*rb->current_tick - back_deadline) >= 0)
++            break;              /* the module did not answer BACK: do not trap the user here */
++
++        /* keep-alive every 2 s; until the module has shown a screen, ask again */
++        if ((long)(*rb->current_tick - next_tick) >= 0) {
++            send_request(have_menu ? REQ_TICK : REQ_OPEN, -1);
++            next_tick = *rb->current_tick + 2 * HZ;
++        }
++
++        if (sel >= n_cur)
++            sel = n_cur > 0 ? n_cur - 1 : 0;
++        if (sel < top)
++            top = sel;
++        if (sel >= top + visible)
++            top = sel - visible + 1;
++
++        draw(visible);
++
++        action = rb->get_action(CONTEXT_LIST, HZ / 10);
++        switch (action) {
++        case ACTION_STD_PREV:
++        case ACTION_STD_PREVREPEAT:
++            if (sel > 0)
++                sel--;
++            if (n_cur > 0)
++                sel_id = cur[sel].id;
++            break;
++        case ACTION_STD_NEXT:
++        case ACTION_STD_NEXTREPEAT:
++            if (sel < n_cur - 1)
++                sel++;
++            if (n_cur > 0)
++                sel_id = cur[sel].id;
++            break;
++        case ACTION_STD_OK:
++            if (have_menu && n_cur > 0)
++                send_request(REQ_SELECT, cur[sel].id);
++            break;
++        case ACTION_STD_CANCEL:
++            if (!have_menu) {
++                want_exit = true;
++            } else {
++                send_request(REQ_BACK, -1);
++                back_deadline = *rb->current_tick + 2 * HZ;
++            }
++            break;
++        default:
++            if (rb->default_event_handler(action) == SYS_USB_CONNECTED) {
++                send_request(REQ_CLOSE, -1);
++                return PLUGIN_USB_CONNECTED;
++            }
++            break;
++        }
++        if (want_exit)
++            break;
++    }
++
++    send_request(REQ_CLOSE, -1);
++    return PLUGIN_OK;
++}
